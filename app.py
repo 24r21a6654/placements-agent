@@ -12,24 +12,28 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.agents import create_agent
 from langserve import add_routes
-
+ 
 # --- 1. LLM ---
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY environment variable is not set on this server.")
+ 
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
-    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+    model="gemini-2.5-flash",
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.3,
 )
-
+ 
 search_engine = DuckDuckGoSearchResults()
-
-# --- 2. Tools (identical to the notebook versions) ---
+ 
+# --- 2. Tools ---
 @tool
 def job_search(role: str) -> str:
     """Search the web for current job openings matching a given role."""
     query = f"{role} job openings India 2026"
     return search_engine.invoke(query)
-
-
+ 
+ 
 @tool
 def skill_gap_analysis(role: str, resume_text: str) -> str:
     """Compare the student's resume skills against the requirements of a target role and list missing skills."""
@@ -41,8 +45,8 @@ def skill_gap_analysis(role: str, resume_text: str) -> str:
     )
     response = llm.invoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
-
-
+ 
+ 
 @tool
 def project_ideas(missing_skills: str) -> str:
     """Suggest 3 practical project ideas to help a student build the given missing skills."""
@@ -53,13 +57,20 @@ def project_ideas(missing_skills: str) -> str:
     )
     response = llm.invoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
-
-
+ 
+ 
 @tool
 def github_check(github_username: str) -> str:
     """Check a student's GitHub profile for recent public repo activity and languages used."""
     url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=5"
-    response = requests.get(url)
+    try:
+        response = requests.get(url, timeout=10)
+    except requests.RequestException as e:
+        return f"GitHub request failed: {e}"
+    if response.status_code == 404:
+        return f"GitHub user '{github_username}' not found."
+    if response.status_code == 403:
+        return "GitHub API rate limit reached, try again later."
     if response.status_code != 200:
         return f"Could not fetch GitHub data for user: {github_username}"
     repos = response.json()
@@ -68,10 +79,10 @@ def github_check(github_username: str) -> str:
         for repo in repos
     ]
     return "Recent repos: " + "; ".join(summary) if summary else "No public repos found."
-
-
+ 
+ 
 tools = [job_search, skill_gap_analysis, project_ideas, github_check]
-
+ 
 career_agent = create_agent(
     model=llm,
     tools=tools,
@@ -84,15 +95,15 @@ career_agent = create_agent(
         "End with a clear, structured summary."
     ),
 )
-
-
+ 
+ 
 # --- 3. Shared schema + helpers ---
 class CareerAgentInput(BaseModel):
     resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
     target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
     github_username: str = Field(..., description="Student's GitHub username")
-
-
+ 
+ 
 def extract_final_text(agent_result: dict) -> str:
     for msg in reversed(agent_result.get("messages", [])):
         if msg.__class__.__name__ != "AIMessage":
@@ -105,8 +116,8 @@ def extract_final_text(agent_result: dict) -> str:
                 if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
                     return block["text"]
     return ""
-
-
+ 
+ 
 def run_career_agent(payload: CareerAgentInput) -> dict:
     query = (
         f"My target role is '{payload.target_role}'. "
@@ -128,19 +139,17 @@ def run_career_agent(payload: CareerAgentInput) -> dict:
         "tools_used": tool_calls_made,
         "final_summary": extract_final_text(result),
     }
-
-
+ 
+ 
 career_chain = RunnableLambda(run_career_agent)
-
+ 
 # --- 4. FastAPI app ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
-
-# Text-based route - good for programmatic callers that already have resume
-# text, and for LangServe's own /career-agent/playground UI.
+ 
 add_routes(app, career_chain, path="/career-agent", playground_type="default")
-
-
-# --- 5. PDF upload route (the actual API used by the homepage form below) ---
+ 
+ 
+# --- 5. PDF upload route ---
 @app.post("/career-agent/upload")
 async def career_agent_upload(
     resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
@@ -149,25 +158,29 @@ async def career_agent_upload(
 ):
     if resume_pdf.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="resume_pdf must be a PDF file")
-
+ 
     pdf_bytes = await resume_pdf.read()
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         resume_text = "\n".join(page.extract_text() or "" for page in reader.pages)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
-
+ 
     if not resume_text.strip():
         raise HTTPException(status_code=400, detail="No extractable text found in PDF")
-
+ 
     payload = CareerAgentInput(
         resume_text=resume_text,
         target_role=target_role,
         github_username=github_username,
     )
-    return run_career_agent(payload)
-
-
+ 
+    try:
+        return run_career_agent(payload)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent run failed: {e}")
+ 
+ 
 # --- 6. Homepage with a direct PDF-upload form + formatted results ---
 HOMEPAGE_HTML = """
 <!DOCTYPE html>
@@ -190,7 +203,7 @@ HOMEPAGE_HTML = """
     }
     button:disabled { background: #a5a5a5; cursor: not-allowed; }
     #status { margin-top: 16px; font-size: 0.9rem; color: #555; }
-
+ 
     #resultBox { display: none; margin-top: 24px; }
     .meta-row {
       display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 16px;
@@ -214,24 +227,24 @@ HOMEPAGE_HTML = """
   </style>
 </head>
 <body>
-  <h1>🎓 Placement-Ready AI Career Agent</h1>
+  <h1>&#127891; Placement-Ready AI Career Agent</h1>
   <p>Upload your resume PDF, tell it your target role and GitHub username, and it'll search jobs, find skill gaps, suggest projects, and check your GitHub activity.</p>
-
+ 
   <form id="agentForm">
     <label for="resume_pdf">Resume (PDF)</label>
     <input type="file" id="resume_pdf" name="resume_pdf" accept="application/pdf" required />
-
+ 
     <label for="target_role">Target Role</label>
     <input type="text" id="target_role" name="target_role" placeholder="e.g. Machine Learning Engineer" required />
-
+ 
     <label for="github_username">GitHub Username</label>
     <input type="text" id="github_username" name="github_username" placeholder="e.g. octocat" required />
-
+ 
     <button type="submit" id="submitBtn">Run Career Agent</button>
   </form>
-
+ 
   <div id="status"></div>
-
+ 
   <div id="resultBox">
     <div class="meta-row">
       <div>Target Role<span id="roleOut"></span></div>
@@ -240,7 +253,7 @@ HOMEPAGE_HTML = """
     <div class="tools-used" id="toolsOut"></div>
     <div id="summaryOut"></div>
   </div>
-
+ 
   <script>
     const form = document.getElementById("agentForm");
     const statusEl = document.getElementById("status");
@@ -250,38 +263,43 @@ HOMEPAGE_HTML = """
     const toolsOut = document.getElementById("toolsOut");
     const summaryOut = document.getElementById("summaryOut");
     const submitBtn = document.getElementById("submitBtn");
-
+ 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       resultBox.style.display = "none";
       submitBtn.disabled = true;
       statusEl.textContent = "Running agent... this can take 20-60 seconds.";
-
+ 
       const formData = new FormData();
       formData.append("resume_pdf", document.getElementById("resume_pdf").files[0]);
       formData.append("target_role", document.getElementById("target_role").value);
       formData.append("github_username", document.getElementById("github_username").value);
-
+ 
       try {
         const res = await fetch("/career-agent/upload", { method: "POST", body: formData });
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+          const text = await res.text();
+          statusEl.textContent = "Server error (status " + res.status + "): " + text.slice(0, 200);
+          return;
+        }
         const data = await res.json();
         if (!res.ok) {
           statusEl.textContent = "Error: " + (data.detail || res.statusText);
         } else {
           statusEl.textContent = "Done.";
           resultBox.style.display = "block";
-
+ 
           roleOut.textContent = data.student_role || "";
           ghOut.textContent = data.github_username || "";
-
+ 
           toolsOut.innerHTML = "";
           (data.tools_used || []).forEach(t => {
             const el = document.createElement("span");
             el.textContent = t;
             toolsOut.appendChild(el);
           });
-
-          // Render final_summary as real Markdown instead of a raw JSON string
+ 
           summaryOut.innerHTML = marked.parse(data.final_summary || "(no summary returned)");
         }
       } catch (err) {
@@ -294,10 +312,12 @@ HOMEPAGE_HTML = """
 </body>
 </html>
 """
-
+ 
 @app.get("/", response_class=HTMLResponse)
 async def homepage():
     return HOMEPAGE_HTML
+ 
+ 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
