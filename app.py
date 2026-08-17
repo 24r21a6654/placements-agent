@@ -1,23 +1,20 @@
 import os
+import io
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
-from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.agents import create_agent
-from langserve import add_routes
  
 # --- 1. LLM ---
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
  
 if not GOOGLE_API_KEY:
-    raise RuntimeError(
-        "GOOGLE_API_KEY environment variable is not set. "
-        "Set it on your deployment host before starting the app."
-    )
+    raise RuntimeError("GOOGLE_API_KEY environment variable is not set on this server.")
  
 llm = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
@@ -28,7 +25,7 @@ llm = ChatGoogleGenerativeAI(
 search_engine = DuckDuckGoSearchResults()
  
  
-# --- 2. Tools (identical to the notebook versions) ---
+# --- 2. Tools ---
 @tool
 def job_search(role: str) -> str:
     """Search the web for current job openings matching a given role."""
@@ -92,11 +89,12 @@ career_agent = create_agent(
 )
  
  
-# --- 3. Request/response schema for the API ---
-class CareerAgentInput(BaseModel):
-    resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
-    target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
-    github_username: str = Field(..., description="Student's GitHub username")
+def extract_resume_text(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract any text from the uploaded PDF.")
+    return text
  
  
 def extract_final_text(agent_result: dict) -> str:
@@ -113,44 +111,60 @@ def extract_final_text(agent_result: dict) -> str:
     return ""
  
  
-def run_career_agent(payload: CareerAgentInput) -> dict:
-    query = (
-        f"My target role is '{payload.target_role}'. "
-        f"My GitHub username is '{payload.github_username}'. "
-        f"Here is my resume:\n{payload.resume_text}\n\n"
-        f"Please find job openings, analyze my skill gaps, suggest projects, "
-        f"and check my GitHub activity."
-    )
-    result = career_agent.invoke({"messages": [HumanMessage(content=query)]})
-    tool_calls_made = [
-        tc["name"]
-        for msg in result["messages"]
-        if hasattr(msg, "tool_calls") and msg.tool_calls
-        for tc in msg.tool_calls
-    ]
-    return {
-        "student_role": payload.target_role,
-        "github_username": payload.github_username,
-        "tools_used": tool_calls_made,
-        "final_summary": extract_final_text(result),
-    }
- 
- 
-career_chain = RunnableLambda(run_career_agent)
- 
-# --- 4. FastAPI app ---
+# --- 4. FastAPI app (plain, no LangServe) ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
  
-add_routes(
-    app,
-    career_chain,
-    path="/career-agent",
-    input_type=CareerAgentInput,
-    playground_type="default",
-)
+ 
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Career Agent is running. POST a PDF (multipart/form-data) to /career-agent"}
+ 
+ 
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+ 
+ 
+@app.post("/career-agent")
+async def run_career_agent(
+    resume: UploadFile = File(..., description="Resume PDF file"),
+    target_role: str = Form(..., description="Role the student is targeting"),
+    github_username: str = Form(..., description="Student's GitHub username"),
+):
+    try:
+        if resume.content_type != "application/pdf" and not resume.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Please upload a PDF file.")
+ 
+        pdf_bytes = await resume.read()
+        resume_text = extract_resume_text(pdf_bytes)
+ 
+        query = (
+            f"My target role is '{target_role}'. "
+            f"My GitHub username is '{github_username}'. "
+            f"Here is my resume:\n{resume_text}\n\n"
+            f"Please find job openings, analyze my skill gaps, suggest projects, "
+            f"and check my GitHub activity."
+        )
+        result = career_agent.invoke({"messages": [HumanMessage(content=query)]})
+        tool_calls_made = [
+            tc["name"]
+            for msg in result["messages"]
+            if hasattr(msg, "tool_calls") and msg.tool_calls
+            for tc in msg.tool_calls
+        ]
+        return {
+            "student_role": target_role,
+            "github_username": github_username,
+            "tools_used": tool_calls_made,
+            "final_summary": extract_final_text(result),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
  
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
- 
