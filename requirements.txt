@@ -10,4 +10,6 @@ langgraph
 requests
 pypdf
 ddgs
+duckduckgo-search
 sse_starlette
+ 
