@@ -1,6 +1,5 @@
 fastapi
-uvicorn
-langserve
+uvicorn[standard]
 langchain-core
 langchain
 langchain-google-genai
@@ -9,4 +8,4 @@ langgraph
 requests
 pypdf
 ddgs
-sse_starlette
+python-multipart
