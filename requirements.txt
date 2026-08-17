@@ -8,4 +8,5 @@ langgraph
 requests
 pypdf
 ddgs
+duckduckgo-search
 python-multipart
