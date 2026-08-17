@@ -9,24 +9,33 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.agents import create_agent
 from langserve import add_routes
-
+ 
 # --- 1. LLM ---
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+ 
+if not GOOGLE_API_KEY:
+    raise RuntimeError(
+        "GOOGLE_API_KEY environment variable is not set. "
+        "Set it on your deployment host before starting the app."
+    )
+ 
 llm = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
-    google_api_key=os.environ.get("GOOGLE_API_KEY"),
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.3,
 )
-
+ 
 search_engine = DuckDuckGoSearchResults()
-
+ 
+ 
 # --- 2. Tools (identical to the notebook versions) ---
 @tool
 def job_search(role: str) -> str:
     """Search the web for current job openings matching a given role."""
     query = f"{role} job openings India 2026"
     return search_engine.invoke(query)
-
-
+ 
+ 
 @tool
 def skill_gap_analysis(role: str, resume_text: str) -> str:
     """Compare the student's resume skills against the requirements of a target role and list missing skills."""
@@ -38,8 +47,8 @@ def skill_gap_analysis(role: str, resume_text: str) -> str:
     )
     response = llm.invoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
-
-
+ 
+ 
 @tool
 def project_ideas(missing_skills: str) -> str:
     """Suggest 3 practical project ideas to help a student build the given missing skills."""
@@ -50,8 +59,8 @@ def project_ideas(missing_skills: str) -> str:
     )
     response = llm.invoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
-
-
+ 
+ 
 @tool
 def github_check(github_username: str) -> str:
     """Check a student's GitHub profile for recent public repo activity and languages used."""
@@ -65,10 +74,10 @@ def github_check(github_username: str) -> str:
         for repo in repos
     ]
     return "Recent repos: " + "; ".join(summary) if summary else "No public repos found."
-
-
+ 
+ 
 tools = [job_search, skill_gap_analysis, project_ideas, github_check]
-
+ 
 career_agent = create_agent(
     model=llm,
     tools=tools,
@@ -81,15 +90,15 @@ career_agent = create_agent(
         "End with a clear, structured summary."
     ),
 )
-
-
+ 
+ 
 # --- 3. Request/response schema for the API ---
 class CareerAgentInput(BaseModel):
     resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
     target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
     github_username: str = Field(..., description="Student's GitHub username")
-
-
+ 
+ 
 def extract_final_text(agent_result: dict) -> str:
     for msg in reversed(agent_result.get("messages", [])):
         if msg.__class__.__name__ != "AIMessage":
@@ -102,8 +111,8 @@ def extract_final_text(agent_result: dict) -> str:
                 if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
                     return block["text"]
     return ""
-
-
+ 
+ 
 def run_career_agent(payload: CareerAgentInput) -> dict:
     query = (
         f"My target role is '{payload.target_role}'. "
@@ -125,16 +134,23 @@ def run_career_agent(payload: CareerAgentInput) -> dict:
         "tools_used": tool_calls_made,
         "final_summary": extract_final_text(result),
     }
-
-
+ 
+ 
 career_chain = RunnableLambda(run_career_agent)
-
+ 
 # --- 4. FastAPI app ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
-
-add_routes(app, career_chain, path="/career-agent", playground_type="default")
-
+ 
+add_routes(
+    app,
+    career_chain,
+    path="/career-agent",
+    input_type=CareerAgentInput,
+    playground_type="default",
+)
+ 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+ 
